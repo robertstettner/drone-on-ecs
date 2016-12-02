@@ -1,0 +1,433 @@
+---
+Description: Drone Continuous Integration (drone.io)
+
+
+Parameters:
+
+  VPC:
+    Type: AWS::EC2::VPC::Id
+    Description: The VPC that needs provisioning
+
+  PublicSubnets:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: The subnets that the load balancer will cover
+
+  PrivateSubnets:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: The subnets that the ASG will cover
+
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: Name of an AWS keypair to use on instances
+
+  HostedZoneId:
+    Type: String
+    Description: The ID of the Route53 Hosted Zone
+
+  HostedZoneName:
+    Type: String
+    Description: The name of the Route53 Hosted Zone
+
+  DatabaseName:
+    Type: String
+    Description: The name for the PostgreSQL Database
+
+  DatabaseUsername:
+    Type: String
+    Description: The username for the PostgreSQL Database
+
+  DatabasePassword:
+    Type: String
+    Description: The password for the PostgreSQL Database
+    NoEcho: true
+
+  DatabaseSubnets:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: The subnets for the PostgreSQL Database
+
+  DatabaseInstanceClass:
+    Type: String
+    Description: The DB instance type to build
+    Default: db.t2.small
+
+  DroneBitbucketClient:
+    Type: String
+    Description: The Bitbucket Client ID for Drone
+
+  DroneBitbucketSecret:
+    Type: String
+    Description: The Bitbucket secret for Drone
+    NoEcho: true
+
+  DroneSecret:
+    Type: String
+    Description: The secret for Drone
+    NoEcho: true
+
+  DroneAdmins:
+    Type: String
+    Description: The administrators for Drone
+
+  DroneMemoryAllocation:
+    Type: Number
+    Description: The amount of memory to allocate to the Drone container
+    Default: 2000
+
+  DroneCpuUnits:
+    Type: Number
+    Description: How many CPU units to allocate to the Drone container
+    Default: 1024
+
+  DroneAgentMaxBuildProcesses:
+    Type: Number
+    Description: How many Docker concurrent build processes per Drone agent
+    Default: 4
+
+  DroneInstanceType:
+    Type: String
+    Description: The EC2 instance type to build
+    Default: t2.small
+
+  IncomingHttpCidr:
+    Type: String
+    Description: A CIDR range to restrict incoming HTTP to the load balancer
+    Default: 0.0.0.0/0
+
+  DockerUsername:
+    Type: String
+    Description: The username for Docker Hub Registry
+
+  DockerPassword:
+    Type: String
+    Description: The password for Docker Hub Registry
+    NoEcho: true
+
+
+Mappings:
+  AWSRegionToAMI:
+    us-east-1:
+      AMIID: ami-1924770e
+    us-east-2:
+      AMIID: ami-bd3e64d8
+    us-west-1:
+      AMIID: ami-7f004b1f
+    us-west-2:
+      AMIID: ami-56ed4936
+    eu-west-1:
+      AMIID: ami-c8337dbb
+    eu-central-1:
+      AMIID: ami-dd12ebb2
+    ap-northeast-1:
+      AMIID: ami-c8b016a9
+    ap-southeast-1:
+      AMIID: ami-6d22840e
+    ap-southeast-2:
+      AMIID: ami-73407d10
+
+
+Resources:
+
+  Cluster:
+    Type: AWS::ECS::Cluster
+
+  ServerTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      ContainerDefinitions:
+      - Name: DroneServer
+        Essential: true
+        Image: drone/drone:0.5
+        Memory: !Ref DroneMemoryAllocation
+        Cpu: !Ref DroneCpuUnits
+        PortMappings:
+        - ContainerPort: 8000
+        LogConfiguration:
+          LogDriver: awslogs
+          Options:
+            awslogs-group: !Ref LogGroup
+            awslogs-region: !Ref 'AWS::Region'
+        Environment:
+        - Name: DRONE_BITBUCKET
+          Value: true
+        - Name: DRONE_BITBUCKET_CLIENT
+          Value: !Ref DroneBitbucketClient
+        - Name: DRONE_BITBUCKET_SECRET
+          Value: !Ref DroneBitbucketSecret
+        - Name: DRONE_SECRET
+          Value: !Ref DroneSecret
+        - Name: DATABASE_DRIVER
+          Value: postgres
+        - Name: DATABASE_CONFIG
+          Value: !Sub postgres://${DatabaseUsername}:${DatabasePassword}@${Database.Endpoint.Address}:${Database.Endpoint.Port}/${DatabaseName}?sslmode=disable
+        - Name: DRONE_OPEN
+          Value: true
+        - Name: DRONE_ADMIN
+          Value: !Ref DroneAdmins
+        - Name: DRONE_ORGS
+          Value: myorg
+    DependsOn:
+    - Database
+
+  AgentTaskDefinition:
+      Type: AWS::ECS::TaskDefinition
+      Properties:
+        ContainerDefinitions:
+        - Name: DroneAgent
+          Essential: true
+          Memory: !Ref DroneMemoryAllocation
+          Cpu: !Ref DroneCpuUnits
+          Image: drone/drone:0.5
+          Command:
+            - agent
+          MountPoints:
+          - ContainerPath: /var/run/docker.sock
+            SourceVolume: docker-socket
+          Environment:
+          - Name: DRONE_SERVER
+            Value: !Sub wss://drone.${HostedZoneName}/ws/broker
+          - Name: DRONE_SECRET
+            Value: !Ref DroneSecret
+          - Name: DOCKER_MAX_PROCS
+            Value: !Ref DroneAgentMaxBuildProcesses
+        Volumes:
+        - Name: docker-socket
+          Host:
+            SourcePath: /var/run/docker.sock
+
+  LoadBalancerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security associated to the Drone load balancer
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+      - FromPort: 443
+        ToPort: 443
+        IpProtocol: tcp
+        CidrIp: !Ref IncomingHttpCidr
+      Tags:
+      - Key: Name
+        Value: droneci-loadbalancer-sg
+
+  InstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Only allow traffic via the Drone load balancer
+      SecurityGroupIngress:
+      - IpProtocol: -1
+        SourceSecurityGroupId: !Ref LoadBalancerSecurityGroup
+      - FromPort: 22
+        ToPort: 22
+        IpProtocol: tcp
+        CidrIp: 0.0.0.0/0
+      VpcId: !Ref VPC
+      Tags:
+      - Key: Name
+        Value: droneci-instance-sg
+    DependsOn:
+    - LoadBalancerSecurityGroup
+
+  DatabaseSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Only allow traffic via the Instances
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        CidrIp: 0.0.0.0/0
+        FromPort: 5432
+        ToPort: 5432
+      - IpProtocol: tcp
+        SourceSecurityGroupId: !Ref InstanceSecurityGroup
+        FromPort: 5432
+        ToPort: 5432
+    DependsOn:
+    - InstanceSecurityGroup
+
+  ServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - ecs.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Policies:
+      - PolicyName: droneci-ecs-service-role
+        PolicyDocument:
+          Version: 2012-10-17
+          Statement:
+          - Effect: Allow
+            Action:
+            - ec2:AuthorizeSecurityGroupIngress
+            - ec2:Describe*
+            - elasticloadbalancing:DeregisterInstancesFromLoadBalancer
+            - elasticloadbalancing:DeregisterTargets
+            - elasticloadbalancing:Describe*
+            - elasticloadbalancing:RegisterInstancesWithLoadBalancer
+            - elasticloadbalancing:RegisterTargets
+            - logs:CreateLogStream
+            - logs:PutLogEvents
+            Resource: '*'
+
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: drone-ci
+
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: droneci-loadbalancer
+      Subnets: !Ref PublicSubnets
+      SecurityGroups:
+        - !Ref LoadBalancerSecurityGroup
+      Tags:
+      - Key: Name
+        Value: droneci-loadbalancer
+    DependsOn:
+    - LoadBalancerSecurityGroup
+
+  LoadBalancerListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+      - TargetGroupArn: !Ref LoadBalancerTargetGroup
+        Type: forward
+      LoadBalancerArn: !Ref LoadBalancer
+      Certificates:
+      - CertificateArn: !ImportValue tm-awx-SSL-certificate
+      Port: 443
+      Protocol: HTTPS
+
+  LoadBalancerTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      HealthCheckIntervalSeconds: 30
+      HealthCheckPath: /
+      HealthCheckTimeoutSeconds: 20
+      HealthyThresholdCount: 2
+      Port: 8000
+      Protocol: HTTP
+      UnhealthyThresholdCount: 6
+      VpcId: !Ref VPC
+
+  LaunchConfiguration:
+    Type: AWS::AutoScaling::LaunchConfiguration
+    Properties:
+      AssociatePublicIpAddress: false
+      IamInstanceProfile: arn:aws:iam::430105358689:instance-profile/Dev-buildserver
+      ImageId: !FindInMap [ AWSRegionToAMI, !Ref 'AWS::Region', AMIID ]
+      InstanceType: !Ref DroneInstanceType
+      KeyName: !Ref KeyName
+      SecurityGroups:
+      - !Ref InstanceSecurityGroup
+      UserData:
+        Fn::Base64:
+          !Sub |
+            #!/bin/bash -xe
+            yum install -y aws-cli nfs-utils
+            aws s3 cp s3://tm-dockercredentials/ecs/ecs.config /etc/ecs/ecs.config
+            echo "ECS_CLUSTER=${Cluster}" >> /etc/ecs/ecs.config
+            echo "ECS_AVAILABLE_LOGGING_DRIVERS=[\"json-file\",\"awslogs\"]" >> /etc/ecs/ecs.config
+            docker login -u ${DockerUsername} -p ${DockerPassword}
+            \cp -R /root/.docker /home/ec2-user && chown -R ec2-user:ec2-user /home/ec2-user/.docker
+            docker ps
+            service docker restart
+            start ecs
+    DependsOn:
+    - Cluster
+    - InstanceSecurityGroup
+
+  AutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      DesiredCapacity: 2
+      MaxSize: 4
+      MinSize: 2
+      HealthCheckType: EC2
+      LaunchConfigurationName: !Ref LaunchConfiguration
+      VPCZoneIdentifier: !Ref PrivateSubnets
+      Tags:
+      - Key: Name
+        Value: droneci
+        PropagateAtLaunch: true
+    DependsOn:
+    - LaunchConfiguration
+
+  ServerService:
+    Type: AWS::ECS::Service
+    Properties:
+      Cluster: !Ref Cluster
+      DesiredCount: 1
+      LoadBalancers:
+      - ContainerName: DroneServer
+        ContainerPort: 8000
+        TargetGroupArn: !Ref LoadBalancerTargetGroup
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 0
+      Role: !Ref ServiceRole
+      TaskDefinition: !Ref ServerTaskDefinition
+    DependsOn:
+    - Cluster
+    - ServerTaskDefinition
+    - ServiceRole
+    - LoadBalancer
+
+  AgentService:
+    Type: AWS::ECS::Service
+    Properties:
+      Cluster: !Ref Cluster
+      DesiredCount: 1
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 0
+      TaskDefinition: !Ref AgentTaskDefinition
+    DependsOn:
+    - Cluster
+    - AgentTaskDefinition
+
+  RecordSet:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      AliasTarget:
+        HostedZoneId: !GetAtt LoadBalancer.CanonicalHostedZoneID
+        DNSName: !GetAtt LoadBalancer.DNSName
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Sub drone.${HostedZoneName}.
+      Type: A
+    DependsOn:
+    - LoadBalancer
+
+  Database:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      AllocatedStorage: 100
+      AutoMinorVersionUpgrade: true
+      AllowMajorVersionUpgrade: true
+      DBName: !Ref DatabaseName
+      DBInstanceClass: !Ref DatabaseInstanceClass
+      DBSubnetGroupName: !Ref DatabaseSubnetGroup
+      Engine: postgres
+      EngineVersion: 9.6.1
+      MasterUsername: !Ref DatabaseUsername
+      MasterUserPassword: !Ref DatabasePassword
+      VPCSecurityGroups:
+      - !Ref DatabaseSecurityGroup
+    DependsOn:
+    - DatabaseSubnetGroup
+    - DatabaseSecurityGroup
+
+  DatabaseSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Drone CI DB Subnet Group
+      SubnetIds: !Ref DatabaseSubnets
+
+
+Outputs:
+  OAuthEndpoint:
+    Value: !Sub https://${RecordSet}/authorize
