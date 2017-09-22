@@ -314,11 +314,32 @@ Resources:
       UnhealthyThresholdCount: 6
       VpcId: !Ref VPC
 
+  IAMRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: ec2.amazonaws.com
+          Action: sts:AssumeRole
+      Path: /
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/AdministratorAccess
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: /
+      Roles:
+      - !Ref IAMRole
+
   LaunchConfiguration:
     Type: AWS::AutoScaling::LaunchConfiguration
     Properties:
       AssociatePublicIpAddress: false
-      IamInstanceProfile: arn:aws:iam::430105358689:instance-profile/Dev-buildserver
+      IamInstanceProfile: !Ref InstanceProfile
       ImageId: !FindInMap [ AWSRegionToAMI, !Ref 'AWS::Region', AMIID ]
       InstanceType: !Ref DroneInstanceType
       KeyName: !Ref KeyName
