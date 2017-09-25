@@ -175,7 +175,7 @@ Resources:
         - Name: DroneAgent
           Essential: true
           Memory: !Ref DroneMemoryAllocation
-          Cpu: !Ref DroneCpuUnits
+          Cpu: 900
           Image: drone/drone:0.5
           Command:
             - agent
@@ -200,6 +200,10 @@ Resources:
       GroupDescription: Security associated to the Drone load balancer
       VpcId: !Ref VPC
       SecurityGroupIngress:
+      - FromPort: 80
+        ToPort: 80
+        IpProtocol: tcp
+        CidrIp: !Ref IncomingHttpCidr
       - FromPort: 443
         ToPort: 443
         IpProtocol: tcp
@@ -448,6 +452,81 @@ Resources:
       DBSubnetGroupDescription: Drone CI DB Subnet Group
       SubnetIds: !Ref DatabaseSubnets
 
+### HTTP Redirector
+
+  HTTPSRedirectLoadBalancerTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      HealthCheckIntervalSeconds: 30
+      HealthCheckPath: /
+      HealthCheckTimeoutSeconds: 20
+      HealthyThresholdCount: 2
+      Matcher:
+        HttpCode: 200-399
+      Port: 80
+      Protocol: HTTP
+      UnhealthyThresholdCount: 6
+      VpcId: !Ref VPC
+      TargetGroupAttributes:
+      - Key: deregistration_delay.timeout_seconds
+        Value: 5
+    DependsOn:
+      - LoadBalancer
+
+  HTTPSRedirectLoadBalancerListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+      - TargetGroupArn: !Ref HTTPSRedirectLoadBalancerTargetGroup
+        Type: forward
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 80
+      Protocol: HTTP
+    DependsOn:
+      - HTTPSRedirectLoadBalancerTargetGroup
+
+  HTTPSRedirectLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: drone-ci-http-redirector
+
+  HTTPSRedirectTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      ContainerDefinitions:
+      - Name: HTTPSRedirector
+        Essential: true
+        Image: hope/redirect-http-to-https
+        PortMappings:
+        - ContainerPort: 80
+        Memory: 100
+        Cpu: 100
+        LogConfiguration:
+          LogDriver: awslogs
+          Options:
+            awslogs-group: !Ref HTTPSRedirectLogGroup
+            awslogs-region: !Ref 'AWS::Region'
+
+  HTTPSRedirectService:
+    Type: AWS::ECS::Service
+    Properties:
+      Cluster: !Ref Cluster
+      PlacementConstraints:
+        - Type: memberOf
+          Expression: attribute:drone-instance-type == agent
+      DesiredCount: 1
+      LoadBalancers:
+      - ContainerName: HTTPSRedirector
+        ContainerPort: 80
+        TargetGroupArn: !Ref HTTPSRedirectLoadBalancerTargetGroup
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 0
+      Role: !Ref ServiceRole
+      TaskDefinition: !Ref HTTPSRedirectTaskDefinition
+    DependsOn:
+    - HTTPSRedirectLoadBalancerListener
+    - HTTPSRedirectTaskDefinition
 
 Outputs:
   OAuthEndpoint:
